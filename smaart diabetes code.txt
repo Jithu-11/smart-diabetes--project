@@ -1,0 +1,432 @@
+import pandas as pd
+import numpy as np
+import json
+import requests
+import time
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, classification_report
+# Removed: from IPython.display import display, Markdown
+!pip install gradio
+import gradio as gr
+# --- 1. LLM Setup and API Function (Updated for Gemini 2.5) ---
+
+# ✅ Correct model name from your verified list
+MODEL_NAME = "models/gemini-2.5-flash"
+
+# 🔑 Paste your *real* Gemini API key here (keep it private)
+API_KEY = "AIzaSyCyOmn-NKYTzQbVIHh4i6gvMiCj1zeHwHc"
+
+# ✅ Updated API URL using the v1 endpoint
+API_URL = f"https://generativelanguage.googleapis.com/v1/{MODEL_NAME}:generateContent?key={API_KEY}"
+
+SYSTEM_INSTRUCTION = (
+    "You are a helpful and concise medical AI assistant specializing in Smart Diabetes Prediction. "
+    "Your role is to answer user questions based on the provided diabetes risk prediction model context and general medical knowledge. "
+    "Focus on explaining diabetes, interpreting the features like HbA1c, BMI, and blood glucose, and clarifying the model's output (risk of 0 or 1). "
+    "Keep answers supportive, informative, and simple for a beginner."
+)
+
+def call_gemini_api(prompt, system_instruction, max_retries=3):
+    """Calls the Gemini API with retries and proper JSON handling."""
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "contents": [
+            {"parts": [{"text": f"{system_instruction}\n\nUser prompt:\n{prompt}"}]}
+        ]
+    }
+
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(API_URL, headers=headers, json=payload)
+            if response.status_code == 200:
+                data = response.json()
+                if "candidates" in data:
+                    return data["candidates"][0]["content"]["parts"][0]["text"]
+                else:
+                    return "⚠️ No valid response from Gemini model."
+            else:
+                time.sleep(1)
+        except Exception as e:
+            print(f"⚠️ Gemini API call failed (attempt {attempt+1}): {e}")
+            time.sleep(1)
+
+    return "⚠️ Gemini API unreachable after multiple attempts."
+
+
+# --- 2. Data Loading and Model Training ---
+
+def load_and_train_model(file_path):
+    """Loads data, trains the model, and returns the pipeline and accuracy."""
+    print(f"Loading data from: {file_path}")
+    try:
+        df = pd.read_csv(file_path)
+    except FileNotFoundError:
+        print(f"Error: File not found at {file_path}.")
+        return None, 0.0
+
+    # Data Cleaning and Preparation
+    df = df[df['gender'] != 'Other'].copy()
+
+    target_column = 'diabetes'
+    df.dropna(subset=[target_column], inplace=True)
+
+    # Define features and target
+    X = df.drop(columns=[target_column])
+    y = df[target_column]
+
+    # Define column types
+    numerical_features = ['age', 'bmi', 'HbA1c_level', 'blood_glucose_level']
+    binary_features = ['hypertension', 'heart_disease']
+    categorical_features = ['gender', 'smoking_history']
+
+    # Preprocessing Pipelines
+    numerical_pipeline = Pipeline([('scaler', StandardScaler())])
+    categorical_pipeline = Pipeline([('onehot', OneHotEncoder(handle_unknown='ignore'))])
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('num', numerical_pipeline, numerical_features),
+            ('cat', categorical_pipeline, categorical_features),
+            ('bin', 'passthrough', binary_features)
+        ],
+        remainder='drop'
+    )
+
+    # Full Pipeline: Preprocessor + Model (Random Forest is beginner-friendly)
+    model = RandomForestClassifier(n_estimators=100, random_state=42, class_weight='balanced')
+    full_pipeline = Pipeline(steps=[('preprocessor', preprocessor),
+                                    ('classifier', model)])
+
+    # Training
+    y = y.astype(int)
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+    full_pipeline.fit(X_train, y_train)
+
+    # Evaluation
+    y_pred = full_pipeline.predict(X_test)
+    accuracy = accuracy_score(y_test, y_pred)
+
+    print("\n--- Model Training Complete ---")
+    print(f"Random Forest Model Accuracy: {accuracy*100:.2f}%")
+    print("\nClassification Report (Test Set):\n")
+    print(classification_report(y_test, y_pred))
+
+    return full_pipeline, accuracy
+
+# --- 3. Prediction Function (Modified for Gradio) ---
+
+def predict_diabetes_risk(model_pipeline, patient_data):
+    """Makes a prediction for a single patient."""
+    input_df = pd.DataFrame([patient_data])
+
+    if model_pipeline is None:
+        return "Model not trained.", 0, 0
+
+    try:
+        prediction = model_pipeline.predict(input_df)[0]
+        proba = model_pipeline.predict_proba(input_df)[0]
+        risk_proba = proba[1]  # Probability of Class 1 (Diabetes)
+
+        return "Success", prediction, risk_proba
+    except Exception as e:
+        return f"Prediction Error: {e}", 0, 0
+
+def format_prediction_report(status, prediction, risk_proba, patient_data):
+    """Formats the prediction results into a Gradio Markdown string with requested enhancements."""
+
+    if status != "Success":
+        return f"### Prediction Failed\n\nError: {status}"
+
+    risk_status = "Likely Diabetes (High Risk)" if prediction == 1 else "Unlikely Diabetes (Low Risk)"
+
+    # Use different colors for the risk status
+    color = "red" if prediction == 1 else "green"
+    icon = "🚨" if prediction == 1 else "✅"
+
+    # --- 1. Interpretation Paragraph (Requested Change 3) ---
+    if prediction == 1:
+        interpretation_text = (
+            "Based on the provided patient metrics, the model suggests a *high probability* of diabetes. "
+            "This conclusion is primarily driven by the elevated values in key indicators such as "
+            "HbA1c level, blood glucose level, and potentially high BMI or existing cardiovascular conditions. "
+            "It is important to understand that this is a model prediction, not a definitive diagnosis. "
+            "Confirmation via clinical testing is essential."
+        )
+    else:
+        interpretation_text = (
+            "Based on the provided patient metrics, the model suggests a *low probability* of diabetes. "
+            "The patient's key indicators, including HbA1c and blood glucose levels, are generally within ranges typically "
+            "associated with non-diabetic individuals. While this prediction is reassuring, maintaining a healthy "
+            "lifestyle and regular medical screenings remains crucial for long-term health."
+        )
+
+    # --- 2. Immediate Action (Requested Change 4 - Bigger Paragraph) ---
+    if prediction == 1:
+        action_text = (
+            "Given the elevated risk score, *IMMEDIATE CONSULTATION with a qualified healthcare professional is strongly advised.* "
+            "Do not rely solely on this prediction for diagnosis. A doctor can order definitive diagnostic tests, such as a fasting plasma glucose test or an oral glucose tolerance test, "
+            "and recommend an appropriate treatment and management plan, which may involve comprehensive lifestyle changes or necessary medication."
+        )
+        # Style for high-risk action
+        action_style = 'color:red; background-color: #fef2f2; border: 2px solid #ff4d4d; padding: 20px; border-radius: 10px; font-size: 1.25em; line-height: 1.6;'
+    else:
+        action_text = (
+            "The current risk is low, but consistent health management is vital. *Maintain a healthy, balanced diet, engage in regular physical activity, and prioritize adequate sleep.* "
+            "It is recommended to continue regular check-ups with your physician to monitor your blood pressure, cholesterol, and blood glucose levels annually, ensuring early detection of any future changes."
+        )
+        # Style for low-risk action
+        action_style = 'color:green; background-color: #f0fff4; border: 2px solid #5cb85c; padding: 20px; border-radius: 10px; font-size: 1.25em; line-height: 1.6;'
+
+
+    # --- 3. Final Report Assembly ---
+    report = f"""
+    ## {icon} Prediction Result: <span style="color:{color};">{risk_status}</span>
+
+    ---
+
+    ### 📊 Key Findings
+
+    - *Predicted Risk Class:* {prediction} (0 = No Diabetes, 1 = Diabetes)
+    - *Probability of Diabetes:* **{risk_proba*100:.1f}%**
+
+    ### 📝 Patient Metrics Summary
+
+    | Metric | Value |
+    | :--- | :--- |
+    | *Age* | {patient_data['age']} |
+    | *BMI* | {patient_data['bmi']:.2f} |
+    | *HbA1c Level* | {patient_data['HbA1c_level']:.1f} |
+    | *Blood Glucose Level* | {patient_data['blood_glucose_level']} |
+    | *Hypertension* | {'Yes' if patient_data['hypertension'] == 1 else 'No'} |
+    | *Heart Disease* | {'Yes' if patient_data['heart_disease'] == 1 else 'No'} |
+    | *Smoking History* | {patient_data['smoking_history'].capitalize()} |
+
+
+    ### 💡 Model Interpretation
+    <p style="font-size: 1.1em; line-height: 1.6;">{interpretation_text}</p>
+
+    ### 🚀 Immediate Action Recommended
+    <div style="{action_style}">
+        {action_text}
+    </div>
+    """
+    return report
+
+def gradio_predict(gender, age, hypertension, heart_disease, smoking_history, bmi, hba1c_level, blood_glucose_level):
+    """Main Gradio prediction function."""
+    # Ensure numerical inputs are converted correctly
+    try:
+        # Note: Gradio's click event passes all inputs in the order they are defined in the list
+        age = float(age)
+        bmi = float(bmi)
+        hba1c_level = float(hba1c_level)
+        blood_glucose_level = int(blood_glucose_level)
+        hypertension = int(hypertension)
+        heart_disease = int(heart_disease)
+    except ValueError:
+        return "### Input Error: All numerical fields must be valid numbers."
+
+    patient_data = {
+        'gender': gender,
+        'age': age,
+        'hypertension': hypertension,
+        'heart_disease': heart_disease,
+        'smoking_history': smoking_history,
+        'bmi': bmi,
+        'HbA1c_level': hba1c_level,
+        'blood_glucose_level': blood_glucose_level
+    }
+
+    # Use the globally defined MODEL_PIPELINE
+    global MODEL_PIPELINE
+    status, prediction, risk_proba = predict_diabetes_risk(MODEL_PIPELINE, patient_data)
+
+    return format_prediction_report(status, prediction, risk_proba, patient_data)
+
+# --- 4. Virtual Assistant Function (Modified for Gradio Chat) ---
+
+# Helper function to update the history and call the LLM
+def user_submit(message, history):
+    """Appends user message to history and calls the LLM."""
+
+    # Append the user's message immediately (Gradio expects a generator yield or return)
+    # The history list is a list of [user_message, assistant_message] pairs.
+    history = history + [[message, None]]
+    return "", history # Return empty string for textbox and updated history
+
+def bot_response(history):
+    """Gets the LLM response for the latest user message."""
+    global MODEL_ACCURACY
+
+    # Get the last user message
+    message = history[-1][0]
+
+    # Prepare context for the LLM
+    context_data = {
+        "model_type": "RandomForestClassifier",
+        "target": "Diabetes Risk (0 or 1)",
+        "accuracy": f"{MODEL_ACCURACY*100:.2f}%",
+        "features": "Age, BMI, HbA1c Level, Blood Glucose Level, Hypertension, Heart Disease, Gender, Smoking History"
+    }
+
+    full_prompt = (
+        f"User Query: {message}\n\n"
+        "Context about the Diabetes Model:\n"
+        f"{json.dumps(context_data, indent=2)}"
+    )
+
+    # Call the existing API function
+    response_text = call_gemini_api(full_prompt, SYSTEM_INSTRUCTION)
+
+    # Update the last entry in history with the bot's response
+    history[-1][1] = response_text
+
+    return history
+
+
+# --- 5. Main Execution Block for Colab (Gradio Interface) ---
+
+if __name__ == "__main__":
+
+    # Note: For Colab, you might need to run: !pip install gradio
+    print("If Gradio is not installed, please run: !pip install gradio")
+
+    # 5.1. Model Setup (Global variables for Gradio functions)
+    MODEL_PIPELINE, MODEL_ACCURACY = load_and_train_model("diabetes_prediction_dataset.csv")
+
+    if MODEL_PIPELINE is None:
+        exit()
+
+    # --- Gradio Interface Definition ---
+
+    # Define all input components first
+    gender_input = gr.Radio(choices=['Female', 'Male'], label="Gender", value='Female')
+    age_input = gr.Slider(minimum=1.0, maximum=100.0, step=0.1, label="Age", value=50.0)
+    htn_input = gr.Radio(choices=[('No', 0), ('Yes', 1)], label="Hypertension", value=0)
+    hd_input = gr.Radio(choices=[('No', 0), ('Yes', 1)], label="Heart Disease", value=0)
+    smoking_input = gr.Dropdown(choices=['never', 'former', 'current', 'not current', 'No Info'], label="Smoking History", value='never')
+    bmi_input = gr.Slider(minimum=10.0, maximum=70.0, step=0.1, label="BMI (Body Mass Index)", value=25.0)
+    hba1c_input = gr.Slider(minimum=3.0, maximum=10.0, step=0.1, label="HbA1c Level (%)", value=5.7)
+    glucose_input = gr.Slider(minimum=80, maximum=300, step=1, label="Blood Glucose Level (mg/dL)", value=140)
+
+    # Output component
+    output_markdown = gr.Markdown(label="Prediction Report")
+
+
+    # 1. Prediction Tab (Using gr.Blocks for landscape layout)
+    # Removed title from gr.Blocks
+    with gr.Blocks() as prediction_tab:
+
+        gr.Markdown(
+            f"<p style='font-size: 1.1em; color: #555;'> Enter patient data below to predict diabetes risk (0=No Diabetes, 1=Diabetes).</p>"
+        )
+
+        # Row 1: Key patient demographics
+        with gr.Row():
+            gender_input.render()
+            age_input.render()
+            smoking_input.render()
+
+        # Row 2: Primary laboratory metrics
+        with gr.Row():
+            bmi_input.render()
+            hba1c_input.render()
+            glucose_input.render()
+
+        # Row 3: Binary disease flags
+        with gr.Row():
+            htn_input.render()
+            hd_input.render()
+            # Adding an empty column to balance the layout in landscape view
+            gr.Column(scale=1)
+
+        predict_button = gr.Button("Calculate Diabetes Risk", variant="primary")
+
+        output_markdown.render()
+
+        # Define the click event and the order of inputs
+        predict_button.click(
+            fn=gradio_predict,
+            inputs=[gender_input, age_input, htn_input, hd_input, smoking_input, bmi_input, hba1c_input, glucose_input],
+            outputs=output_markdown
+        )
+
+
+    # 2. Virtual Assistant Tab (Using gr.Blocks instead of gr.ChatInterface)
+    # Removed title from gr.Blocks
+    with gr.Blocks() as assistant_tab:
+        gr.Markdown(
+            "<h1>Virtual Medical Assistant 💬</h1>"
+            "<p>Ask me questions about diabetes, risk factors (like HbA1c or BMI), or how the prediction model works. </p>"
+        )
+
+        # State to store the chat history (list of [user, bot] pairs)
+        chatbot = gr.Chatbot(height=450, label="Chat History")
+        msg = gr.Textbox(label="Ask a question...", placeholder="e.g., What does a high HbA1c level mean?")
+
+        with gr.Row():
+            submit_btn = gr.Button("Send", variant="primary")
+            clear_btn = gr.Button("Clear Chat")
+
+        # Event flow:
+        # 1. User submits message (msg, chatbot history)
+        # 2. user_submit clears the textbox and immediately adds the user message to history
+        # 3. bot_response takes the history and calls the LLM, then updates the history
+
+        submit_btn.click(
+            fn=user_submit,
+            inputs=[msg, chatbot],
+            outputs=[msg, chatbot],
+            queue=False
+        ).then(
+            fn=bot_response,
+            inputs=chatbot,
+            outputs=chatbot
+        )
+
+        msg.submit(
+            fn=user_submit,
+            inputs=[msg, chatbot],
+            outputs=[msg, chatbot],
+            queue=False
+        ).then(
+            fn=bot_response,
+            inputs=chatbot,
+            outputs=chatbot
+        )
+
+        # Clear button event
+        clear_btn.click(lambda: None, None, chatbot, queue=False).success(lambda: [], None, chatbot)
+
+    # 3. Combined Tabs
+    tabbed_interface = gr.TabbedInterface(
+        [prediction_tab, assistant_tab],
+        ["Diabetes Predictor", "Virtual Assistant"]
+    )
+
+    # Combine header and tabbed interface vertically
+    app_interface = gr.Blocks()
+    with app_interface:
+        gr.Markdown(
+            "<h1>Smart Diabetes Prediction Using Machine Learning for Early Risk Stratification</h1>"
+        )
+        gr.Markdown(
+            f"""
+            <p style='font-size: 1.1em; color: #555; margin-top: 9px;'>
+            AI-driven Machine Learning model trained on 8 significant clinical features (including glucose, BMI, and age). The model generates a probabilistic risk score based on patient data, providing an accurate, data-driven prediction for clinical assessment.
+            </p>
+            <p style='font-size: 1.1em; color: #555; margin-top: -10px;'>
+            <b>Model Accuracy: {MODEL_ACCURACY*100:.2f}%</b>
+            </p>
+            """
+        )
+        tabbed_interface.render()
+
+
+    # Launch the Gradio app (Colab environment handles hosting)
+    print("\nStarting Gradio Interface...")
+    app_interface.launch(inline=True, share=True)
